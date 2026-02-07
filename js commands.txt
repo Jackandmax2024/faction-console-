@@ -1,0 +1,548 @@
+    // Configuration
+    const CHUNK_SIZE = 16;      // In-game blocks per chunk
+    const TILE_SIZE = 256;      // Pixels per chunk tile (16 blocks × 16 pixels per block)
+    // Shifted zoom levels to avoid negative Leaflet zoom (which causes tile unloading bugs)
+    const BASE_ZOOM = 8;        // Leaflet zoom level that corresponds to tile zoom=0 (1 tile = 1 chunk)
+    const MIN_ZOOM = 0;         // Minimum Leaflet zoom (zoomed out) - corresponds to tile zoom -8 (generated)
+    const MAX_ZOOM = 11;        // Maximum Leaflet zoom (zoomed in) - corresponds to tile zoom +3
+
+    // Cache busting timestamp
+    let cacheBuster = Date.now();
+
+    // Player tracking
+    const playerMarkers = new Map();
+    let selectedPlayerId = null;
+    let sidebarOpen = true;
+
+    // Head texture cache (canvas elements)
+    const headTextureCache = new Map();
+
+    // Calculate default center from game coordinates (x=175.5, z=414.5)
+    const defaultX = 175.5;
+    const defaultZ = 414.5;
+    const crsUnitsPerTile = TILE_SIZE / Math.pow(2, BASE_ZOOM);
+    const defaultUnitsPerBlock = crsUnitsPerTile / CHUNK_SIZE;
+    const defaultCenter = [-defaultZ * defaultUnitsPerBlock, defaultX * defaultUnitsPerBlock];
+    const defaultZoom = BASE_ZOOM - 4; // Tile zoom -4
+
+    // Use Simple CRS
+    const map = L.map('map', {
+        crs: L.CRS.Simple,
+        center: defaultCenter,
+        zoom: defaultZoom,
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+        zoomControl: true,
+        attributionControl: false
+    });
+
+    // Custom tile layer with zoom support
+    L.TileLayer.ChunkLayer = L.TileLayer.extend({
+        getTileUrl: function(coords) {
+            // Convert Leaflet zoom to tile zoom
+            // At BASE_ZOOM (8), tile zoom = 0 (1 tile = 1 chunk)
+            // At Leaflet zoom 7, tile zoom = -1 (1 tile = 2x2 chunks)
+            // At Leaflet zoom 0, tile zoom = -8 (most zoomed out)
+            const tileZoom = coords.z - BASE_ZOOM;
+
+            // At tile zoom 0: coords directly = chunk coords
+            // At tile zoom -1: each tile covers 2x2 chunks, so tile (0,0) = chunks (0,0) to (1,1)
+            // At tile zoom -2: each tile covers 4x4 chunks
+            // At tile zoom +1: each chunk is split into 2x2 tiles (but we don't have that detail)
+
+            // For positive tile zoom, we scale down to the base chunk
+            // For negative tile zoom, coords directly map to the combined tile index
+
+            let url;
+            if (tileZoom >= 0) {
+                // Zoomed in past base level - calculate which chunk this tile is part of
+                const scale = Math.pow(2, tileZoom);
+                const chunkX = Math.floor(coords.x / scale);
+                const chunkZ = Math.floor(coords.y / scale);
+                // Still request zoom 0 since we don't have more detail
+                url = `/api/map/chunk/0/${chunkX}/${chunkZ}?t=${cacheBuster}`;
+            } else {
+                // Zoomed out - request combined tiles
+                // tileZoom is negative, coords.x/y are the tile indices at that zoom level
+                url = `/api/map/chunk/${tileZoom}/${coords.x}/${coords.y}?t=${cacheBuster}`;
+            }
+            return url;
+        },
+
+        createTile: function(coords, done) {
+            const tile = document.createElement('img');
+            tile.alt = '';
+            tile.setAttribute('role', 'presentation');
+            tile.style.imageRendering = 'pixelated';
+
+            const url = this.getTileUrl(coords);
+
+            tile.onload = function() {
+                done(null, tile);
+            };
+
+            tile.onerror = function() {
+                // Hide broken image icon and show background color
+                tile.style.visibility = 'hidden';
+                tile.parentElement.style.background = 'rgb(42, 42, 62)';
+                done(null, tile);
+            };
+
+            tile.src = url;
+            return tile;
+        }
+    });
+
+    // Add tile layer - set infinite bounds to prevent tile pruning at low zoom
+    const tileLayer = new L.TileLayer.ChunkLayer('', {
+        tileSize: TILE_SIZE,
+        noWrap: true,
+        keepBuffer: 8,
+        updateWhenZooming: false,
+        updateWhenIdle: false,  // Don't re-fetch tiles when idle
+        bounds: [[-1e9, -1e9], [1e9, 1e9]],  // Essentially infinite bounds
+        maxNativeZoom: BASE_ZOOM,  // Don't request higher detail than we have
+        minNativeZoom: MIN_ZOOM,   // Request zoom-out tiles down to this level (generated)
+        errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+    }).addTo(map);
+
+    // Update coordinates display on mouse move
+    map.on('mousemove', function(e) {
+        // In Simple CRS at BASE_ZOOM, tile size in CRS units = TILE_SIZE / 2^BASE_ZOOM
+        // One tile = one chunk = 16 blocks
+        // So unitsPerBlock = (TILE_SIZE / 2^BASE_ZOOM) / CHUNK_SIZE
+        const crsUnitsPerTile = TILE_SIZE / Math.pow(2, BASE_ZOOM);
+        const unitsPerBlock = crsUnitsPerTile / CHUNK_SIZE;
+
+        const blockX = Math.floor(e.latlng.lng / unitsPerBlock);
+        const blockZ = -Math.floor(e.latlng.lat / unitsPerBlock);
+        const chunkX = Math.floor(blockX / CHUNK_SIZE);
+        const chunkZ = Math.floor(blockZ / CHUNK_SIZE);
+
+        document.getElementById('coordsText').textContent =
+            `X: ${blockX}, Z: ${blockZ} | Chunk: ${chunkX}, ${chunkZ}`;
+    });
+
+    // Control functions
+    function goToCoords() {
+        const x = parseInt(document.getElementById('gotoX').value) || 0;
+        const z = parseInt(document.getElementById('gotoZ').value) || 0;
+
+        const crsUnitsPerTile = TILE_SIZE / Math.pow(2, BASE_ZOOM);
+        const unitsPerBlock = crsUnitsPerTile / CHUNK_SIZE;
+        map.setView([-z * unitsPerBlock, x * unitsPerBlock], map.getZoom());
+    }
+
+    function goToOrigin() {
+        document.getElementById('gotoX').value = 0;
+        document.getElementById('gotoZ').value = 0;
+        map.setView([0, 0], BASE_ZOOM);
+    }
+
+    function clearCache() {
+        // Update cache buster to force reload all tiles
+        cacheBuster = Date.now();
+        // Remove and re-add the tile layer to force refresh
+        tileLayer.redraw();
+    }
+
+    // Hide loading overlay
+    function hideLoading() {
+        const overlay = document.getElementById('loading-overlay');
+        overlay.style.transition = 'opacity 0.5s';
+        overlay.style.opacity = '0';
+        setTimeout(() => {
+            overlay.style.display = 'none';
+        }, 500);
+    }
+
+    // Toggle sidebar
+    function toggleSidebar() {
+        sidebarOpen = !sidebarOpen;
+        const sidebar = document.getElementById('playerSidebar');
+        const toggle = document.getElementById('sidebarToggle');
+        const icon = document.getElementById('sidebarToggleIcon');
+        const mapEl = document.getElementById('map');
+
+        if (sidebarOpen) {
+            sidebar.classList.remove('hidden');
+            toggle.classList.add('sidebar-open');
+            icon.classList.remove('bi-chevron-right');
+            icon.classList.add('bi-chevron-left');
+            mapEl.classList.add('sidebar-open');
+        } else {
+            sidebar.classList.add('hidden');
+            toggle.classList.remove('sidebar-open');
+            icon.classList.remove('bi-chevron-left');
+            icon.classList.add('bi-chevron-right');
+            mapEl.classList.remove('sidebar-open');
+        }
+
+        // Invalidate map size after transition
+        setTimeout(() => map.invalidateSize(), 350);
+    }
+
+    // Convert game coordinates to Leaflet coordinates
+    function gameToLeaflet(x, z) {
+        const crsUnitsPerTile = TILE_SIZE / Math.pow(2, BASE_ZOOM);
+        const unitsPerBlock = crsUnitsPerTile / CHUNK_SIZE;
+        return [-z * unitsPerBlock, x * unitsPerBlock]; // [lat, lng]
+    }
+
+    // Create head texture from skin image
+    function createHeadTexture(skinId, callback) {
+        if (!skinId) {
+            callback(null);
+            return;
+        }
+
+        // Check cache first
+        if (headTextureCache.has(skinId)) {
+            callback(headTextureCache.get(skinId));
+            return;
+        }
+
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = function() {
+            // Create canvas to extract head (face is at 8,8 with size 8x8 in a 64x64 skin)
+            const canvas = document.createElement('canvas');
+            canvas.width = 8;
+            canvas.height = 8;
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = false;
+
+            // Draw the face part of the skin (at position 8,8 in the 64x64 texture)
+            ctx.drawImage(img, 8, 8, 8, 8, 0, 0, 8, 8);
+
+            const dataUrl = canvas.toDataURL();
+            headTextureCache.set(skinId, dataUrl);
+            callback(dataUrl);
+        };
+        img.onerror = function() {
+            callback(null);
+        };
+        img.src = `/api/game/skin/image/${skinId}`;
+    }
+
+    // Create player marker
+    function createPlayerMarker(player) {
+        const pos = player.Pose?.Head?.Position;
+        if (!pos) return null;
+
+        const [lat, lng] = gameToLeaflet(pos[0], pos[2]);
+        const id = String(player.id || player.Username);
+
+        // Create icon HTML with data attributes for later update
+        const iconHtml = `
+            <div style="position: relative;">
+                <img class="player-marker" id="marker-img-${id}" alt="${player.Username}"
+                     src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+                <div class="player-marker-label">${player.Username}</div>
+            </div>
+        `;
+
+        const icon = L.divIcon({
+            html: iconHtml,
+            className: '',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
+
+        const marker = L.marker([lat, lng], { icon: icon });
+
+        // Load head texture after marker is added
+        if (player.SkinId) {
+            createHeadTexture(player.SkinId, (dataUrl) => {
+                if (dataUrl) {
+                    // Update the marker image
+                    const imgEl = document.getElementById(`marker-img-${id}`);
+                    if (imgEl) {
+                        imgEl.src = dataUrl;
+                    }
+                }
+            });
+            marker.loadedSkinId = player.SkinId;
+        } else {
+            marker.loadedSkinId = '';
+        }
+
+        // Store player data on marker for click handling
+        marker.playerData = player;
+
+        // Click to focus
+        marker.on('click', () => {
+            focusOnPlayer(marker.playerData);
+        });
+
+        return marker;
+    }
+
+    // Update player marker position
+    function updatePlayerMarker(marker, player) {
+        const pos = player.Pose?.Head?.Position;
+        if (!pos) return;
+
+        const [lat, lng] = gameToLeaflet(pos[0], pos[2]);
+        marker.setLatLng([lat, lng]);
+
+        // Check if skin changed
+        const newSkinId = player.SkinId || '';
+        const oldSkinId = marker.loadedSkinId || '';
+        if (newSkinId !== oldSkinId) {
+            const id = String(player.id || player.Username);
+            if (newSkinId) {
+                createHeadTexture(newSkinId, (dataUrl) => {
+                    if (dataUrl) {
+                        const imgEl = document.getElementById(`marker-img-${id}`);
+                        if (imgEl) {
+                            imgEl.src = dataUrl;
+                        }
+                    }
+                });
+            }
+            marker.loadedSkinId = newSkinId;
+        }
+
+        marker.playerData = player; // Update stored data for click handler
+    }
+
+    // Focus on player
+    function focusOnPlayer(player) {
+        const id = String(player.id || player.Username);
+        selectedPlayerId = id;
+
+        // Update sidebar selection
+        document.querySelectorAll('.player-list-item').forEach(item => {
+            item.classList.toggle('active', item.dataset.playerId === id);
+        });
+
+        // Fly to player location with sidebar offset compensation
+        const pos = player.Pose?.Head?.Position;
+        if (pos) {
+            const [lat, lng] = gameToLeaflet(pos[0], pos[2]);
+            const targetZoom = map.getZoom(); // Keep current zoom level
+
+            // Account for sidebar offset when open
+            // Desktop: sidebar on left (280px) → shift X
+            // Mobile: sidebar at bottom (200px) → shift Y
+            if (sidebarOpen) {
+                const isMobile = window.innerWidth <= 768;
+                const targetPoint = map.project([lat, lng], targetZoom);
+
+                if (isMobile) {
+                    const sidebarHeight = 200;
+                    targetPoint.y += sidebarHeight / 2; // Shift down to compensate for bottom sidebar
+                } else {
+                    const sidebarWidth = 280;
+                    targetPoint.x += sidebarWidth / 2; // Shift right to compensate for left sidebar
+                }
+
+                const adjustedLatLng = map.unproject(targetPoint, targetZoom);
+                map.flyTo(adjustedLatLng, targetZoom, { duration: 0.5 });
+            } else {
+                map.flyTo([lat, lng], targetZoom, { duration: 0.5 });
+            }
+        }
+    }
+
+    // Track loaded skin IDs for each player in the list
+    const loadedListSkins = new Map();
+
+    // Render player list (incremental updates)
+    function renderPlayerList(players) {
+        const listEl = document.getElementById('playerList');
+        const countEl = document.getElementById('playerCount');
+        const onlineCountEl = document.getElementById('onlineCount');
+
+        countEl.textContent = players.length;
+        onlineCountEl.textContent = players.length;
+
+        if (players.length === 0) {
+            listEl.innerHTML = '<li class="player-list-empty">No players online</li>';
+            loadedListSkins.clear();
+            return;
+        }
+
+        // Sort by playtime
+        const sorted = [...players].sort((a, b) => {
+            return parsePlaytime(b.PlayTime) - parsePlaytime(a.PlayTime);
+        });
+
+        const currentIds = new Set(sorted.map(p => String(p.id || p.Username)));
+
+        // Remove players no longer in list
+        loadedListSkins.forEach((_, id) => {
+            if (!currentIds.has(id)) {
+                loadedListSkins.delete(id);
+            }
+        });
+
+        // Check if we need to rebuild the list (player count changed or order changed)
+        const existingItems = listEl.querySelectorAll('.player-list-item');
+        const existingIds = Array.from(existingItems).map(el => el.dataset.playerId);
+        const newIds = sorted.map(p => String(p.id || p.Username));
+        const needsRebuild = existingIds.length !== newIds.length ||
+                            !existingIds.every((id, i) => id === newIds[i]);
+
+        if (needsRebuild) {
+            // Full rebuild needed - clear loaded skins since canvases are recreated
+            loadedListSkins.clear();
+
+            listEl.innerHTML = sorted.map(player => {
+                const id = String(player.id || player.Username);
+                const isSelected = selectedPlayerId === id;
+                const pos = player.Pose?.Head?.Position;
+                const coordsStr = pos ? `X: ${Math.round(pos[0])}, Z: ${Math.round(pos[2])}` : '';
+
+                return `
+                    <li class="player-list-item ${isSelected ? 'active' : ''}"
+                        data-player-id="${id}"
+                        data-skin-id="${player.SkinId || ''}"
+                        data-player-json='${JSON.stringify(player).replace(/'/g, "&#39;")}'>
+                        <canvas class="player-head" width="8" height="8"></canvas>
+                        <div class="player-info">
+                            <div class="player-name">${player.Username}</div>
+                            <div class="player-playtime">${player.PlayTime || 'Just joined'}</div>
+                            <div class="player-coords">${coordsStr}</div>
+                        </div>
+                    </li>
+                `;
+            }).join('');
+
+            // Load head textures for new items
+            listEl.querySelectorAll('.player-list-item').forEach(item => {
+                const id = item.dataset.playerId;
+                const skinId = item.dataset.skinId;
+                loadHeadTextureForItem(item, id, skinId);
+            });
+        } else {
+            // Incremental update - just update changed data
+            sorted.forEach((player, index) => {
+                const id = String(player.id || player.Username);
+                const item = existingItems[index];
+                if (!item) return;
+
+                const pos = player.Pose?.Head?.Position;
+                const coordsStr = pos ? `X: ${Math.round(pos[0])}, Z: ${Math.round(pos[2])}` : '';
+
+                // Update data attribute
+                item.dataset.playerJson = JSON.stringify(player).replace(/'/g, "&#39;");
+
+                // Update text content
+                const playtimeEl = item.querySelector('.player-playtime');
+                const coordsEl = item.querySelector('.player-coords');
+                if (playtimeEl) playtimeEl.textContent = player.PlayTime || 'Just joined';
+                if (coordsEl) coordsEl.textContent = coordsStr;
+
+                // Update selection state
+                item.classList.toggle('active', selectedPlayerId === id);
+
+                // Check if skin changed
+                const newSkinId = player.SkinId || '';
+                const oldSkinId = item.dataset.skinId || '';
+                if (newSkinId !== oldSkinId) {
+                    item.dataset.skinId = newSkinId;
+                    loadedListSkins.delete(id);
+                    loadHeadTextureForItem(item, id, newSkinId);
+                }
+            });
+        }
+    }
+
+    // Load head texture for a list item
+    function loadHeadTextureForItem(item, playerId, skinId) {
+        if (!skinId || loadedListSkins.get(playerId) === skinId) return;
+
+        const canvas = item.querySelector('.player-head');
+        if (!canvas) return;
+
+        createHeadTexture(skinId, (dataUrl) => {
+            if (dataUrl) {
+                const ctx = canvas.getContext('2d');
+                const img = new Image();
+                img.onload = () => {
+                    ctx.imageSmoothingEnabled = false;
+                    ctx.drawImage(img, 0, 0, 8, 8);
+                    loadedListSkins.set(playerId, skinId);
+                };
+                img.src = dataUrl;
+            }
+        });
+    }
+
+    // Parse playtime string to minutes
+    function parsePlaytime(playtime) {
+        if (!playtime) return 0;
+        let minutes = 0;
+        const hourMatch = playtime.match(/(\d+)\s*h/i);
+        const minMatch = playtime.match(/(\d+)\s*m/i);
+        if (hourMatch) minutes += parseInt(hourMatch[1]) * 60;
+        if (minMatch) minutes += parseInt(minMatch[1]);
+        return minutes;
+    }
+
+    // Fetch and update players
+    async function fetchPlayers() {
+        try {
+            const response = await fetch(`/api/map/players`);
+            const data = await response.json();
+
+            if (data.success && data.players) {
+                updatePlayers(data.players);
+            }
+        } catch (error) {
+            console.error('Error fetching players:', error);
+        }
+    }
+
+    // Update players on map and list
+    function updatePlayers(players) {
+        const currentIds = new Set(players.map(p => String(p.id || p.Username)));
+
+        // Remove disconnected players
+        playerMarkers.forEach((marker, id) => {
+            if (!currentIds.has(id)) {
+                map.removeLayer(marker);
+                playerMarkers.delete(id);
+            }
+        });
+
+        // Add/update players
+        players.forEach(player => {
+            const id = String(player.id || player.Username);
+
+            if (playerMarkers.has(id)) {
+                // Update existing marker position
+                updatePlayerMarker(playerMarkers.get(id), player);
+            } else {
+                // Create new marker
+                const marker = createPlayerMarker(player);
+                if (marker) {
+                    marker.addTo(map);
+                    playerMarkers.set(id, marker);
+                }
+            }
+        });
+
+        // Update sidebar list
+        renderPlayerList(players);
+    }
+
+    // Handle click on player list
+    document.getElementById('playerList').addEventListener('click', (e) => {
+        const item = e.target.closest('.player-list-item');
+        if (item) {
+            try {
+                const player = JSON.parse(item.dataset.playerJson.replace(/&#39;/g, "'"));
+                focusOnPlayer(player);
+            } catch (err) {
+                console.error('Error parsing player data:', err);
+            }
+        }
+    });
+
+    // Initialize
+    hideLoading();
+    fetchPlayers();
+    setInterval(fetchPlayers, 1000); // Update every second
